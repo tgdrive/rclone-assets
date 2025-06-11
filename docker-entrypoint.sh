@@ -7,6 +7,8 @@ RCLONE_CONFIG_FILE=${RCLONE_CONFIG_FILE:-"/app/rclone/rclone.conf"}
 RCLONE_CACHE_DIR=${RCLONE_CACHE_DIR:-"/var/rclone-cache"}
 RCLONE_CACHE_MAX_AGE=${RCLONE_CACHE_MAX_AGE:-"768h"}
 RCLONE_CACHE_MODE=${RCLONE_CACHE_MODE:-"full"}
+DIR_CACHE_TIME=${DIR_CACHE_TIME:-"8670h"}
+POLL_INTERVAL=${POLL_INTERVAL-"5m"}
 
 # Ensure cache directory exists
 mkdir -p "$RCLONE_CACHE_DIR"
@@ -20,9 +22,11 @@ if [ -n "$RCLONE_REMOTE" ] && [ -n "$RCLONE_REMOTE_PATH" ]; then
         --vfs-cache-mode $RCLONE_CACHE_MODE
         --vfs-cache-max-size $RCLONE_CACHE_SIZE
         --vfs-cache-max-age $RCLONE_CACHE_MAX_AGE
-        --vfs-cache-poll-interval 1m
+        --dir-cache-time $DIR_CACHE_TIME
+        --poll-interval $POLL_INTERVAL
         --cache-dir $RCLONE_CACHE_DIR
         --config $RCLONE_CONFIG_FILE
+        --vfs-refresh
         --allow-other
         --allow-non-empty
         --umask 0000
