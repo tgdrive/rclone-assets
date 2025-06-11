@@ -13,12 +13,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gabriel-vasile/mimetype"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/rs/xid"
+	"golang.org/x/sync/errgroup"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -52,7 +54,7 @@ type Asset struct {
 type AssetService struct {
 	db               *gorm.DB
 	mu               sync.Mutex
-	directoryCounter map[string]int
+	directoryCounter *sync.Map
 }
 
 func getEnv(key, fallback string) string {
@@ -65,7 +67,6 @@ func getEnv(key, fallback string) string {
 var assetService *AssetService
 
 func main() {
-
 	if DATABASE_URL == "" {
 		log.Fatal("DATABASE_URL environment variable is required")
 	}
@@ -85,7 +86,6 @@ func main() {
 			Colorful:                  true,
 		},
 	)
-
 	db, err := gorm.Open(postgres.New(postgres.Config{
 		DSN:                  DATABASE_URL,
 		PreferSimpleProtocol: true,
@@ -101,10 +101,9 @@ func main() {
 	if err := db.AutoMigrate(&Asset{}); err != nil {
 		log.Fatalf("Failed to migrate database: %v", err)
 	}
-
 	assetService = &AssetService{
 		db:               db,
-		directoryCounter: make(map[string]int),
+		directoryCounter: &sync.Map{},
 	}
 
 	if err := assetService.initDirectoryCounters(); err != nil {
@@ -129,18 +128,16 @@ func main() {
 	router.GET("/health", healthCheck)
 
 	api := router.Group("/")
-
-	api.PUT("/upload", APIKeyAuth(), handleRawUpload)
-	api.GET("/assets", APIKeyAuth(), listAssets)
-	api.DELETE("/assets/:id", APIKeyAuth(), deleteAsset)
-	api.GET("/assets/:name", downloadAsset)
+	api.PUT("/upload", APIKeyAuth(), assetService.handleRawUpload)
+	api.GET("/assets", APIKeyAuth(), assetService.listAssets)
+	api.DELETE("/assets/:id", APIKeyAuth(), assetService.deleteAsset)
+	api.GET("/assets/:name", assetService.downloadAsset)
 
 	log.Printf("Starting asset API server on port %s", PORT)
 	if err := router.Run(":" + PORT); err != nil {
 		log.Fatal("Failed to start server: ", err)
 	}
 }
-
 func (s *AssetService) initDirectoryCounters() error {
 	var assets []Asset
 	result := s.db.Select("storage_path").Find(&assets)
@@ -148,14 +145,27 @@ func (s *AssetService) initDirectoryCounters() error {
 		return result.Error
 	}
 
-	for _, asset := range assets {
-		dir := filepath.Dir(asset.StoragePath)
-		s.mu.Lock()
-		s.directoryCounter[dir]++
-		s.mu.Unlock()
-	}
+	var g errgroup.Group
 
-	log.Printf("Initialized directory counters, tracking %d directories", len(s.directoryCounter))
+	g.SetLimit(8)
+
+	for _, asset := range assets {
+		g.Go(func() error {
+			dir := filepath.Dir(asset.StoragePath)
+			actual, _ := s.directoryCounter.LoadOrStore(dir, new(atomic.Int64))
+			counter := actual.(*atomic.Int64)
+			counter.Add(1)
+			return nil
+		})
+	}
+	g.Wait()
+	numDirectories := 0
+	s.directoryCounter.Range(func(key, value any) bool {
+		numDirectories++
+		return true
+	})
+
+	log.Printf("Initialized directory counters, tracking %d directories", numDirectories)
 	return nil
 }
 
@@ -168,7 +178,7 @@ func APIKeyAuth() gin.HandlerFunc {
 			})
 			return
 		}
-
+		c.Next()
 	}
 }
 
@@ -229,21 +239,26 @@ func (s *AssetService) getSmartStoragePath(assetID string) string {
 	}
 
 	basePath := filepath.Join(parts...)
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	baseCounterVal, _ := s.directoryCounter.LoadOrStore(basePath, new(atomic.Int64))
+	baseCounter := baseCounterVal.(*atomic.Int64)
+	currentBaseCount := baseCounter.Load()
 
-	if s.directoryCounter[basePath] >= FILES_PER_DIR {
+	if currentBaseCount >= FILES_PER_DIR {
 		for i := range 100 {
 			newPath := filepath.Join(basePath, fmt.Sprintf("bucket_%d", i))
-			if s.directoryCounter[newPath] < FILES_PER_DIR {
-				s.directoryCounter[newPath]++
+			bucketCounterVal, _ := s.directoryCounter.LoadOrStore(newPath, new(atomic.Int64))
+			bucketCounter := bucketCounterVal.(*atomic.Int64)
+			currentBucketCount := bucketCounter.Load()
+
+			if currentBucketCount < FILES_PER_DIR {
+				bucketCounter.Add(1)
 				return newPath
 			}
 		}
 	}
-
-	s.directoryCounter[basePath]++
+	baseCounter.Add(1)
 	return basePath
 }
 
@@ -283,8 +298,7 @@ func (s *AssetService) countAssets() (int64, error) {
 	return count, result.Error
 }
 
-func handleRawUpload(c *gin.Context) {
-
+func (s *AssetService) handleRawUpload(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, MAX_UPLOAD_SIZE)
 
 	assetID := xid.New().String()
@@ -307,12 +321,12 @@ func handleRawUpload(c *gin.Context) {
 	mtype := mimetype.Detect(buffer[:n])
 	destFileName := assetID + mtype.Extension()
 	filePath := filepath.Join(fullDirPath, destFileName)
+
 	out, err := os.Create(filePath)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, ErrorResponse(500, "Failed to create file"))
 		return
 	}
-
 	defer out.Close()
 
 	bodyReader := io.MultiReader(bytes.NewReader(buffer[:n]), c.Request.Body)
@@ -326,7 +340,7 @@ func handleRawUpload(c *gin.Context) {
 		return
 	}
 
-	fileHash := hex.EncodeToString(hashWriter.Sum(nil))
+	fileHash := hex.EncodeToString(hashWriter.Sum(nil)) // Get the MD5 hash
 
 	asset := &Asset{
 		ID:          assetID,
@@ -348,8 +362,9 @@ func handleRawUpload(c *gin.Context) {
 	})
 }
 
-func listAssets(c *gin.Context) {
+func (s *AssetService) listAssets(c *gin.Context) {
 	limit := 100
+
 	offset := 0
 
 	if limitParam := c.DefaultQuery("limit", ""); limitParam != "" {
@@ -358,20 +373,17 @@ func listAssets(c *gin.Context) {
 			limit = parsedLimit
 		}
 	}
-
 	if offsetParam := c.DefaultQuery("offset", ""); offsetParam != "" {
 		parsedOffset, err := strconv.Atoi(offsetParam)
 		if err == nil && parsedOffset >= 0 {
 			offset = parsedOffset
 		}
 	}
-
 	totalCount, err := assetService.countAssets()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, ErrorResponse(500, "Failed to count assets"))
 		return
 	}
-
 	assets, err := assetService.getAssetsByPage(limit, offset)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, ErrorResponse(500, "Failed to list assets"))
@@ -387,14 +399,13 @@ func listAssets(c *gin.Context) {
 	})
 }
 
-func downloadAsset(c *gin.Context) {
+func (s *AssetService) downloadAsset(c *gin.Context) {
 	assetName := c.Param("name")
-	assetID := strings.Split(c.Param("name"), ".")[0]
+	assetID := strings.Split(assetName, ".")[0]
 	if _, err := xid.FromString(assetID); err != nil {
 		c.JSON(http.StatusBadRequest, ErrorResponse(400, "Invalid asset ID format"))
 		return
 	}
-
 	asset, err := assetService.getAssetByID(assetID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, ErrorResponse(500, "Failed to retrieve asset"))
@@ -405,21 +416,19 @@ func downloadAsset(c *gin.Context) {
 		c.JSON(http.StatusNotFound, ErrorResponse(404, "Asset not found"))
 		return
 	}
-
 	filePath := filepath.Join(STORAGE_PATH, asset.StoragePath, assetName)
 
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
 		c.JSON(http.StatusNotFound, ErrorResponse(404, "Asset file not found on storage"))
 		return
 	}
-
 	c.Header("Content-Disposition", fmt.Sprintf("inline; filename=%s", assetName))
 	c.Header("Cache-Control", "max-age=2592000")
 
 	c.File(filePath)
 }
 
-func deleteAsset(c *gin.Context) {
+func (s *AssetService) deleteAsset(c *gin.Context) {
 	assetID := c.Param("id")
 
 	if _, err := xid.FromString(assetID); err != nil {
@@ -439,7 +448,6 @@ func deleteAsset(c *gin.Context) {
 	}
 
 	filePath := filepath.Join(STORAGE_PATH, asset.StoragePath, asset.FileName)
-
 	if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
 		c.JSON(http.StatusInternalServerError, ErrorResponse(500, "Failed to delete asset file"))
 		return
@@ -450,12 +458,16 @@ func deleteAsset(c *gin.Context) {
 		return
 	}
 
-	assetService.mu.Lock()
-	dirPath := filepath.Dir(asset.StoragePath)
-	if count, exists := assetService.directoryCounter[dirPath]; exists && count > 0 {
-		assetService.directoryCounter[dirPath]--
+	s.mu.Lock()
+	dirPath := asset.StoragePath
+	if actual, ok := assetService.directoryCounter.Load(dirPath); ok {
+		if counter, ok := actual.(*atomic.Int64); ok {
+			if counter.Load() > 0 {
+				counter.Add(-1)
+			}
+		}
 	}
-	assetService.mu.Unlock()
+	s.mu.Unlock()
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,

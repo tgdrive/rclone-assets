@@ -26,7 +26,6 @@ if [ -n "$RCLONE_REMOTE" ] && [ -n "$RCLONE_REMOTE_PATH" ]; then
         --poll-interval $POLL_INTERVAL
         --cache-dir $RCLONE_CACHE_DIR
         --config $RCLONE_CONFIG_FILE
-        --vfs-refresh
         --allow-other
         --allow-non-empty
         --umask 0000
