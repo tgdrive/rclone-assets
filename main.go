@@ -30,8 +30,8 @@ const (
 	PORT               = "8080"
 	MAX_UPLOAD_SIZE    = 50 << 20
 	ALLOWED_DOMAINS    = "*"
-	DIR_SHARDING_DEPTH = 2
-	FILES_PER_DIR      = 1000
+	DIR_SHARDING_DEPTH = 1
+	FILES_PER_DIR      = 5000
 )
 
 var (
