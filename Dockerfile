@@ -40,6 +40,8 @@ RUN chmod +x /app/rclone-api
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 RUN chown -R appuser:appgroup /app /app/rclone-assets
 
+ENV XDG_CONFIG_HOME=/config
+
 COPY docker-entrypoint.sh /
 RUN chmod +x /docker-entrypoint.sh
 
