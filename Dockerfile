@@ -1,10 +1,5 @@
 # syntax=docker/dockerfile:1
-
-FROM tonistiigi/xx AS xx
-
 FROM golang:alpine AS builder
-
-COPY --from=xx / /
 
 RUN apk add --no-cache git gcc musl-dev
 
@@ -19,7 +14,7 @@ RUN go mod download
 
 COPY . .
 
-RUN xx-go build -ldflags="-s -w" -o rclone-api .
+RUN go build -ldflags="-s -w" -o rclone-api .
     
 FROM alpine
 
