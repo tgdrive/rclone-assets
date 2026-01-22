@@ -107,7 +107,7 @@ func main() {
 
 	configfile.Install()
 	config.SetCacheDir(CACHE_DIR)
-	err := config.SetConfigPath(getEnv("CONFIG_PATH", "/config/rclone.conf"))
+	err := config.SetConfigPath(CONFIG_PATH)
 	if err != nil {
 		logger.Fatal("Failed to set rclone config path",
 			zap.String("path", CONFIG_PATH),
