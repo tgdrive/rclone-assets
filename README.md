@@ -1,112 +1,121 @@
-# Asset Storage API
+# Rclone Assets API
 
-A Go-based HTTP API service that provides secure asset management with filesystem storage and PostgreSQL metadata.
+A high-performance, robust asset management microservice written in Go. It leverages **Rclone** for backend storage backend flexibility (S3, GCS, Local, etc.) and uses **PostgreSQL** for metadata management. It features a smart **Content Addressable Storage (CAS)** system with deduplication and a local **VFS Cache** for fast retrieval.
 
 ## Features
 
-- Secure file upload/download API with API key authentication
-- Automatic file organization with smart directory sharding (2 levels deep, 1000 files per directory)
-- MD5 hashing for file integrity
-- PostgreSQL backend for metadata storage
-- CORS support for web applications
-- Health check endpoint for monitoring
-- Configurable upload size limits (default 50MB)
+-   **Backend Agnostic:** Uses [Rclone](https://rclone.org/) to support over 70+ storage providers (AWS S3, Google Drive, Azure Blob, Local Filesystem, etc.).
+-   **High Performance:** Built with [Gin](https://github.com/gin-gonic/gin) and [Gorm](https://gorm.io/).
+-   **Smart Caching:** Implements Rclone's VFS (Virtual File System) with full caching support to minimize remote API calls and speed up reads.
+-   **Deduplication:** Content Addressable Storage (CAS) based on MD5 hashes ensures identical files are only stored once, saving storage space.
+-   **Structured Logging:** Integrated [Zap](https://github.com/uber-go/zap) logger for high-performance, structured logging.
+-   **Secure:** API Key authentication using constant-time comparison to prevent timing attacks.
+-   **Resilient:** Graceful shutdown and signal handling.
 
 ## Requirements
 
-- Go 1.x
-- PostgreSQL database
-- Storage volume mounted at STORAGE_PATH
+-   Go 1.24+
+-   PostgreSQL Database
+-   Rclone configured (or a valid remote string)
 
 ## Environment Variables
 
-Required environment variables:
+Configure the service using the following environment variables:
 
-```env
-DATABASE_URL="postgresql://user:password@localhost:5432/dbname"
-STORAGE_PATH="/path/to/storage"
-API_KEY="your-secure-api-key"
-```
+### Core Configuration
+| Variable | Description | Required | Default |
+|----------|-------------|:--------:|:-------:|
+| `DATABASE_URL` | PostgreSQL connection string (DSN). | Yes | - |
+| `REMOTE_PATH` | Rclone remote path (e.g., `s3:my-bucket/assets` or `/local/path`). | Yes | - |
+| `API_KEY` | Secret key for authenticating API requests. | Yes | - |
+| `PORT` | HTTP port to listen on. | No | `8080` |
+
+### Caching & Performance
+| Variable | Description | Default |
+|----------|-------------|:-------:|
+| `CACHE_DIR` | Local directory for VFS cache. | `/var/cache` |
+| `DIR_CACHE_TIME` | How long to cache directory listings. | `60m` |
+| `CACHE_MAX_AGE` | Max age of objects in the cache. | `24h` |
+| `CACHE_MAX_SIZE` | Max total size of the local cache. | `10G` |
 
 ## API Endpoints
 
-All API endpoints are mounted under `/api` prefix.
+All endpoints (except public download) require the `X-API-Key` header.
 
-### Upload Asset
-```http
-PUT /api/upload
-Header: X-API-Key: your-api-key
-Content-Type: application/octet-stream
+### 1. Upload Asset
+Upload a file. The system calculates the MD5 hash and deduplicates automatically.
 
-[binary data]
-```
+-   **URL:** `/upload`
+-   **Method:** `PUT`
+-   **Headers:** `X-API-Key: <your-key>`
+-   **Body:** Raw binary file content.
 
-Returns:
+**Response:**
 ```json
 {
   "success": true,
-  "message": "File uploaded successfully",
   "asset": {
-    "id": "uuid",
-    "name": "filename",
-    "path": "relative/path",
-    "size": 1234,
-    "created_at": "2025-03-27T00:00:00Z",
-    "updated_at": "2025-03-27T00:00:00Z",
-    "mime_type": "application/octet-stream",
-    "hash": "md5hash"
-  }
+    "id": "c123456789...",
+    "fileName": "c123456789....jpg",
+    "size": 1024,
+    "mimeType": "image/jpeg",
+    "hash": "d41d8cd98f00b204e9800998ecf8427e"
+  },
+  "deduped": false
 }
 ```
 
-### List Assets
-```http
-GET /api/assets
-Header: X-API-Key: your-api-key
-Query params: 
-  - limit (default: 100, max: 1000)
-  - offset (default: 0)
-  - search (optional: filter assets by name)
-```
+### 2. List Assets
+Get a paginated list of assets.
 
-### Get Asset Metadata
-```http
-GET /api/assets/:id
-Header: X-API-Key: your-api-key
-```
+-   **URL:** `/assets`
+-   **Method:** `GET`
+-   **Headers:** `X-API-Key: <your-key>`
+-   **Query Params:**
+    -   `limit`: Number of items (default 100, max 1000).
+    -   `offset`: Pagination offset (default 0).
 
-### Download Asset
-```http
-GET /api/download/:id
-Header: X-API-Key: your-api-key
-```
+### 3. Download Asset
+Stream an asset directly from the cache/storage.
 
-### Delete Asset
-```http
-DELETE /api/assets/:id
-Header: X-API-Key: your-api-key
-```
+-   **URL:** `/assets/:name`
+-   **Method:** `GET`
+-   **Example:** `/assets/c123456789....jpg`
+-   **Note:** The `:name` parameter must start with the Asset ID. The extension is optional but recommended for browsers.
+-   **Auth:** Public (No API Key required by default, unless middleware is changed).
 
-### Health Check
-```http
-GET /api/health
-Header: X-API-Key: your-api-key
-```
+### 4. Delete Asset
+Delete an asset's metadata.
+*Note: Due to the CAS nature, the physical file is strictly deleted only if the hash is unique to this asset (logic implemented in code).*
 
+-   **URL:** `/assets/:id`
+-   **Method:** `DELETE`
+-   **Headers:** `X-API-Key: <your-key>`
 
-## Development
+## Running the Project
 
-1. Clone the repository
-2. Set up required environment variables
-3. Run PostgreSQL database
-4. Create storage directory and set permissions
-5. Run the application:
+### Local Development
+
+1.  **Setup PostgreSQL:** Ensure you have a running database.
+2.  **Run:**
+    ```bash
+    export DATABASE_URL="postgres://user:pass@localhost:5432/assets_db"
+    export REMOTE_PATH="/tmp/assets-local-storage"
+    export API_KEY="secret123"
+    export CACHE_DIR="./tmp/cache"
+    
+    go run main.go
+    ```
+
+### Docker
+
+(Assuming a Dockerfile exists or using the binary)
+
 ```bash
-go run main.go
+docker run -d \
+  -e DATABASE_URL="postgres://..." \
+  -e REMOTE_PATH="s3:my-bucket" \
+  -e API_KEY="secret" \
+  -p 8080:8080 \
+  rclone-assets
 ```
-
-The service will start on port 8080 by default.
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.

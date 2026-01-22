@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 FROM golang:alpine AS builder
 
-RUN apk add --no-cache git gcc musl-dev
+RUN apk add --no-cache git
 
 ARG TARGETPLATFORM
 
@@ -14,30 +14,14 @@ RUN go mod download
 
 COPY . .
 
-RUN go build -ldflags="-s -w" -o rclone-api .
-    
+RUN go build -ldflags="-s -w" -o assets-api .
+
 FROM alpine
 
-RUN apk add --no-cache ca-certificates tzdata fuse3 curl bash su-exec
-
-RUN echo "user_allow_other" >> /etc/fuse.conf
-
-RUN mkdir -p /app/rclone-assets
+RUN apk add --no-cache ca-certificates tzdata
 
 WORKDIR /app
 
-COPY --from=builder /app/rclone-api .
+COPY --from=builder /app/assets-api .
 
-COPY --from=ghcr.io/tgdrive/rclone /usr/local/bin/rclone /usr/bin/rclone
-
-RUN chmod +x /app/rclone-api
-
-RUN addgroup -S appgroup && adduser -S appuser -G appgroup
-RUN chown -R appuser:appgroup /app /app/rclone-assets
-
-ENV XDG_CONFIG_HOME=/config
-
-COPY docker-entrypoint.sh /
-RUN chmod +x /docker-entrypoint.sh
-
-ENTRYPOINT ["/docker-entrypoint.sh"]
+CMD ["/app/assets-api"]
