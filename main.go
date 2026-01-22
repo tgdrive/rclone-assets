@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
@@ -9,25 +10,32 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/gabriel-vasile/mimetype"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/rs/xid"
-	"golang.org/x/sync/errgroup"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
+
+	_ "github.com/rclone/rclone/backend/local"
+	_ "github.com/rclone/rclone/backend/teldrive"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config"
+	"github.com/rclone/rclone/fs/config/configfile"
+	"github.com/rclone/rclone/fs/object"
+	"github.com/rclone/rclone/vfs"
+	"github.com/rclone/rclone/vfs/vfscommon"
 )
 
 const (
-	PORT               = "8080"
 	MAX_UPLOAD_SIZE    = 50 << 20
 	ALLOWED_DOMAINS    = "*"
 	DIR_SHARDING_DEPTH = 1
@@ -35,26 +43,47 @@ const (
 )
 
 var (
-	DATABASE_URL = getEnv("DATABASE_URL", "")
-	STORAGE_PATH = getEnv("STORAGE_PATH", "/app/rclone-assets")
-	API_KEY      = getEnv("API_KEY", "")
+	DATABASE_URL       string
+	RCLONE_REMOTE_PATH string
+	API_KEY            string
+	CACHE_DIR          string
+	PORT               string
 )
 
+func init() {
+
+	DATABASE_URL = getEnv("DATABASE_URL", "")
+	RCLONE_REMOTE_PATH = getEnv("RCLONE_REMOTE_PATH", "")
+	API_KEY = getEnv("API_KEY", "")
+	CACHE_DIR = getEnv("CACHE_DIR", "/var/cache")
+	PORT = getEnv("PORT", "8080")
+
+	if DATABASE_URL == "" {
+		log.Fatal("DATABASE_URL environment variable is required")
+	}
+	if RCLONE_REMOTE_PATH == "" {
+		log.Fatal("RCLONE_REMOTE_PATH environment variable is required (e.g., 's3:bucket/path')")
+	}
+	if API_KEY == "" {
+		log.Fatal("API_KEY environment variable is required")
+	}
+
+}
+
 type Asset struct {
-	ID          string    `json:"id" gorm:"type:varchar(20);primary_key"`
-	StoragePath string    `json:"-" gorm:"not null"`
-	FileName    string    `json:"fileName,omitempty" gorm:"not null"`
-	Size        int64     `json:"size" gorm:"not null"`
-	MimeType    string    `json:"mimeType" gorm:"not null"`
-	Hash        string    `json:"hash,omitempty" gorm:"index"`
-	CreatedAt   time.Time `json:"createdAt" gorm:"autoCreateTime"`
-	UpdatedAt   time.Time `json:"updatedAt" gorm:"autoUpdateTime"`
+	ID        string    `json:"id" gorm:"type:varchar(20);primary_key"`
+	FileName  string    `json:"fileName,omitempty" gorm:"not null"`
+	Size      int64     `json:"size" gorm:"not null"`
+	MimeType  string    `json:"mimeType" gorm:"not null"`
+	Hash      string    `json:"hash,omitempty" gorm:"uniqueIndex:idx_assets_hash;not null"`
+	CreatedAt time.Time `json:"createdAt" gorm:"autoCreateTime;index:idx_assets_created_at"`
+	UpdatedAt time.Time `json:"updatedAt" gorm:"autoUpdateTime"`
 }
 
 type AssetService struct {
-	db               *gorm.DB
-	mu               sync.Mutex
-	directoryCounter *sync.Map
+	db  *gorm.DB
+	fs  fs.Fs
+	vfs *vfs.VFS
 }
 
 func getEnv(key, fallback string) string {
@@ -67,30 +96,51 @@ func getEnv(key, fallback string) string {
 var assetService *AssetService
 
 func main() {
-	if DATABASE_URL == "" {
-		log.Fatal("DATABASE_URL environment variable is required")
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
+
+	defer cancel()
+
+	configfile.Install()
+
+	f, err := fs.NewFs(ctx, RCLONE_REMOTE_PATH)
+
+	if err != nil {
+		log.Fatalf("Failed to initialize Rclone backend for path '%s': %v", RCLONE_REMOTE_PATH, err)
 	}
-	if STORAGE_PATH == "" {
-		log.Fatal("STORAGE_PATH environment variable is required")
+	log.Printf("Rclone backend initialized: %s (%s)", f.Name(), f.String())
+
+	vfsOpts := vfscommon.Opt
+	vfsOpts.CacheMode = vfscommon.CacheModeFull
+
+	dirCacheEnv := getEnv("DIR_CACHE_TIME", "60m")
+	if err := vfsOpts.DirCacheTime.Set(dirCacheEnv); err == nil {
+		_ = vfsOpts.DirCacheTime.Set("60m")
 	}
-	if API_KEY == "" {
-		log.Fatal("API_KEY environment variable is required")
+	maxAgeEnv := getEnv("CACHE_MAX_AGE", "24h")
+	if err := vfsOpts.CacheMaxAge.Set(maxAgeEnv); err == nil {
+		_ = vfsOpts.CacheMaxAge.Set("24h")
 	}
 
-	gormLogger := logger.New(
-		log.New(os.Stdout, "\r\n", log.LstdFlags),
-		logger.Config{
-			SlowThreshold:             time.Second,
-			LogLevel:                  logger.Error,
-			IgnoreRecordNotFoundError: true,
-			Colorful:                  true,
-		},
-	)
+	cacheMaxSizeEnv := getEnv("CACHE_MAX_SIZE", "10G")
+	if err := vfsOpts.CacheMaxSize.Set(cacheMaxSizeEnv); err != nil {
+		_ = vfsOpts.CacheMaxSize.Set("10G")
+	}
+
+	if err := os.MkdirAll(CACHE_DIR, 0755); err != nil {
+		log.Printf("Warning: Failed to create cache dir: %v", err)
+		os.Exit(1)
+	}
+
+	config.SetCacheDir(CACHE_DIR)
+
+	vfsObj := vfs.New(f, &vfsOpts)
+
 	db, err := gorm.Open(postgres.New(postgres.Config{
 		DSN:                  DATABASE_URL,
 		PreferSimpleProtocol: true,
 	}), &gorm.Config{
-		Logger: gormLogger,
+		Logger: logger.Default.LogMode(logger.Silent),
 		NowFunc: func() time.Time {
 			return time.Now().UTC()
 		},
@@ -98,21 +148,18 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
+
 	if err := db.AutoMigrate(&Asset{}); err != nil {
 		log.Fatalf("Failed to migrate database: %v", err)
 	}
+
 	assetService = &AssetService{
-		db:               db,
-		directoryCounter: &sync.Map{},
+		db:  db,
+		fs:  f,
+		vfs: vfsObj,
 	}
 
-	if err := assetService.initDirectoryCounters(); err != nil {
-		log.Printf("Warning: Failed to initialize directory counters: %v", err)
-	}
-
-	if _, err := os.Stat(STORAGE_PATH); os.IsNotExist(err) {
-		log.Fatal("rClone mount path does not exist: ", STORAGE_PATH)
-	}
+	gin.SetMode(gin.ReleaseMode)
 
 	router := gin.Default()
 
@@ -125,48 +172,34 @@ func main() {
 		MaxAge:           12 * time.Hour,
 	}))
 
-	router.GET("/health", healthCheck)
-
 	api := router.Group("/")
 	api.PUT("/upload", APIKeyAuth(), assetService.handleRawUpload)
 	api.GET("/assets", APIKeyAuth(), assetService.listAssets)
 	api.DELETE("/assets/:id", APIKeyAuth(), assetService.deleteAsset)
 	api.GET("/assets/:name", assetService.downloadAsset)
 
-	log.Printf("Starting asset API server on port %s", PORT)
-	if err := router.Run(":" + PORT); err != nil {
-		log.Fatal("Failed to start server: ", err)
-	}
-}
-func (s *AssetService) initDirectoryCounters() error {
-	var assets []Asset
-	result := s.db.Select("storage_path").Find(&assets)
-	if result.Error != nil {
-		return result.Error
+	srv := &http.Server{
+		Addr:    ":" + PORT,
+		Handler: router,
 	}
 
-	var g errgroup.Group
+	go func() {
+		log.Printf("Starting asset API server on port %s", PORT)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("listen: %s\n", err)
+		}
+	}()
 
-	g.SetLimit(8)
+	<-ctx.Done()
 
-	for _, asset := range assets {
-		g.Go(func() error {
-			dir := filepath.Dir(asset.StoragePath)
-			actual, _ := s.directoryCounter.LoadOrStore(dir, new(atomic.Int64))
-			counter := actual.(*atomic.Int64)
-			counter.Add(1)
-			return nil
-		})
+	log.Println("Shutting down server...")
+
+	ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatal("Server forced to shutdown: ", err)
 	}
-	g.Wait()
-	numDirectories := 0
-	s.directoryCounter.Range(func(key, value any) bool {
-		numDirectories++
-		return true
-	})
-
-	log.Printf("Initialized directory counters, tracking %d directories", numDirectories)
-	return nil
+	log.Println("Server exiting")
 }
 
 func APIKeyAuth() gin.HandlerFunc {
@@ -192,74 +225,11 @@ func ErrorResponse(code int, message string) gin.H {
 	}
 }
 
-func healthCheck(c *gin.Context) {
-	sqlDB, err := assetService.db.DB()
-	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"status": "unhealthy",
-			"time":   time.Now().Format(time.RFC3339),
-			"error":  "Database connection failed",
-		})
-		return
+func (s *AssetService) getStoragePath(hash string) string {
+	if len(hash) < 2 {
+		return hash
 	}
-
-	if err := sqlDB.Ping(); err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"status": "unhealthy",
-			"time":   time.Now().Format(time.RFC3339),
-			"error":  "Database ping failed",
-		})
-		return
-	}
-
-	if _, err := os.Stat(STORAGE_PATH); os.IsNotExist(err) {
-		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"status": "unhealthy",
-			"time":   time.Now().Format(time.RFC3339),
-			"error":  "rClone mount not available",
-		})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"status":   "healthy",
-		"time":     time.Now().Format(time.RFC3339),
-		"database": "connected",
-		"storage":  "available",
-	})
-}
-
-func (s *AssetService) getSmartStoragePath(assetID string) string {
-	hash := md5.Sum([]byte(assetID))
-	hexHash := hex.EncodeToString(hash[:])
-
-	parts := make([]string, 0, DIR_SHARDING_DEPTH)
-	for i := 0; i < DIR_SHARDING_DEPTH && i*2 < len(hexHash); i++ {
-		parts = append(parts, hexHash[i*2:i*2+2])
-	}
-
-	basePath := filepath.Join(parts...)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	baseCounterVal, _ := s.directoryCounter.LoadOrStore(basePath, new(atomic.Int64))
-	baseCounter := baseCounterVal.(*atomic.Int64)
-	currentBaseCount := baseCounter.Load()
-
-	if currentBaseCount >= FILES_PER_DIR {
-		for i := range 100 {
-			newPath := filepath.Join(basePath, fmt.Sprintf("bucket_%d", i))
-			bucketCounterVal, _ := s.directoryCounter.LoadOrStore(newPath, new(atomic.Int64))
-			bucketCounter := bucketCounterVal.(*atomic.Int64)
-			currentBucketCount := bucketCounter.Load()
-
-			if currentBucketCount < FILES_PER_DIR {
-				bucketCounter.Add(1)
-				return newPath
-			}
-		}
-	}
-	baseCounter.Add(1)
-	return basePath
+	return filepath.Join(hash[0:2], hash)
 }
 
 func (s *AssetService) saveAssetMetadata(asset *Asset) error {
@@ -301,54 +271,79 @@ func (s *AssetService) countAssets() (int64, error) {
 func (s *AssetService) handleRawUpload(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, MAX_UPLOAD_SIZE)
 
-	assetID := xid.New().String()
-
-	storagePath := assetService.getSmartStoragePath(assetID)
-
-	fullDirPath := filepath.Join(STORAGE_PATH, storagePath)
-	if err := os.MkdirAll(fullDirPath, 0755); err != nil {
-		c.JSON(http.StatusInternalServerError, ErrorResponse(500, "Failed to create directory"))
+	// 1. Save to local temp file to calculate hash and size safely
+	tempFile, err := os.CreateTemp("", "upload-*")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, ErrorResponse(500, "Failed to create temp file"))
 		return
 	}
+	defer os.Remove(tempFile.Name()) // Clean up temp file
+	defer tempFile.Close()
 
-	buffer := make([]byte, 512)
-	n, err := c.Request.Body.Read(buffer)
+	// Read header to detect mime
+	headerBuffer := make([]byte, 512)
+	n, err := c.Request.Body.Read(headerBuffer)
 	if err != nil && err != io.EOF {
 		c.JSON(http.StatusInternalServerError, ErrorResponse(500, "Failed to read request body"))
 		return
 	}
 
-	mtype := mimetype.Detect(buffer[:n])
-	destFileName := assetID + mtype.Extension()
-	filePath := filepath.Join(fullDirPath, destFileName)
+	mtype := mimetype.Detect(headerBuffer[:n])
 
-	out, err := os.Create(filePath)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, ErrorResponse(500, "Failed to create file"))
-		return
-	}
-	defer out.Close()
-
-	bodyReader := io.MultiReader(bytes.NewReader(buffer[:n]), c.Request.Body)
-
+	// Reconstruct reader
+	bodyReader := io.MultiReader(bytes.NewReader(headerBuffer[:n]), c.Request.Body)
 	hashWriter := md5.New()
 	teeReader := io.TeeReader(bodyReader, hashWriter)
 
-	size, err := io.Copy(out, teeReader)
+	size, err := io.Copy(tempFile, teeReader)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, ErrorResponse(500, "Failed to write file"))
+		c.JSON(http.StatusInternalServerError, ErrorResponse(500, "Failed to write temp file"))
 		return
 	}
 
-	fileHash := hex.EncodeToString(hashWriter.Sum(nil)) // Get the MD5 hash
+	// Reset temp file for reading
+	tempFile.Seek(0, 0)
+	fileHash := hex.EncodeToString(hashWriter.Sum(nil))
+	assetID := xid.New().String()
 
+	// CAS Logic: Check if hash already exists
+	var existingAsset Asset
+	if err := s.db.Where("hash = ?", fileHash).First(&existingAsset).Error; err == nil {
+		// Found existing asset - Deduplicate
+		log.Printf("Asset deduplicated: Returning existing ID %s for hash %s", existingAsset.ID, fileHash)
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"asset":   existingAsset,
+			"deduped": true,
+		})
+		return
+	}
+
+	// 2. Upload to Rclone (Only if new)
+	shardedPath := s.getStoragePath(fileHash)
+	// Ensure standard path separator
+	remoteFilePath := shardedPath
+	if os.PathSeparator == '\\' {
+		remoteFilePath = strings.ReplaceAll(remoteFilePath, "\\", "/")
+	}
+
+	ctx := c.Request.Context()
+	objInfo := object.NewStaticObjectInfo(remoteFilePath, time.Now(), size, true, nil, s.fs)
+
+	_, err = s.fs.Put(ctx, tempFile, objInfo)
+	if err != nil {
+		log.Printf("Rclone upload failed: %v", err)
+		c.JSON(http.StatusInternalServerError, ErrorResponse(500, "Failed to upload to storage backend"))
+		return
+	}
+
+	// 3. Save Metadata
 	asset := &Asset{
-		ID:          assetID,
-		StoragePath: storagePath,
-		FileName:    destFileName,
-		Size:        size,
-		MimeType:    mtype.String(),
-		Hash:        fileHash,
+		ID:       assetID,
+		FileName: assetID + mtype.Extension(), // Logical filename
+		Size:     size,
+		MimeType: mtype.String(),
+		Hash:     fileHash,
 	}
 
 	if err := assetService.saveAssetMetadata(asset); err != nil {
@@ -364,7 +359,6 @@ func (s *AssetService) handleRawUpload(c *gin.Context) {
 
 func (s *AssetService) listAssets(c *gin.Context) {
 	limit := 100
-
 	offset := 0
 
 	if limitParam := c.DefaultQuery("limit", ""); limitParam != "" {
@@ -416,16 +410,44 @@ func (s *AssetService) downloadAsset(c *gin.Context) {
 		c.JSON(http.StatusNotFound, ErrorResponse(404, "Asset not found"))
 		return
 	}
-	filePath := filepath.Join(STORAGE_PATH, asset.StoragePath, assetName)
 
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		c.JSON(http.StatusNotFound, ErrorResponse(404, "Asset file not found on storage"))
+	// Construct path from hash (CAS)
+	remoteFilePath := s.getStoragePath(asset.Hash)
+	if os.PathSeparator == '\\' {
+		remoteFilePath = strings.ReplaceAll(remoteFilePath, "\\", "/")
+	}
+
+	// Get Object from Rclone VFS (Cached)
+	// We use the VFS layer here to ensure the file is cached locally on access.
+	// 1. Get File Handle (triggers download to cache if needed)
+	fHandle, err := s.vfs.OpenFile(remoteFilePath, os.O_RDONLY, 0)
+	if err != nil {
+		if os.IsNotExist(err) {
+			c.JSON(http.StatusNotFound, ErrorResponse(404, "Asset file not found on storage"))
+		} else {
+			c.JSON(http.StatusInternalServerError, ErrorResponse(500, "Failed to open cached file"))
+		}
 		return
 	}
+	defer fHandle.Close()
+
+	// 2. Get Info
+	fInfo, err := fHandle.Stat()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, ErrorResponse(500, "Failed to stat cached file"))
+		return
+	}
+
 	c.Header("Content-Disposition", fmt.Sprintf("inline; filename=%s", assetName))
+	c.Header("Content-Length", fmt.Sprintf("%d", fInfo.Size()))
+	c.Header("Content-Type", asset.MimeType)
 	c.Header("Cache-Control", "max-age=2592000")
 
-	c.File(filePath)
+	// 3. Stream from Cache
+	_, err = io.Copy(c.Writer, fHandle)
+	if err != nil {
+		log.Printf("Stream error: %v", err)
+	}
 }
 
 func (s *AssetService) deleteAsset(c *gin.Context) {
@@ -447,27 +469,31 @@ func (s *AssetService) deleteAsset(c *gin.Context) {
 		return
 	}
 
-	filePath := filepath.Join(STORAGE_PATH, asset.StoragePath, asset.FileName)
-	if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
-		c.JSON(http.StatusInternalServerError, ErrorResponse(500, "Failed to delete asset file"))
-		return
-	}
+	// CAS Delete Logic (Strict 1:1 Hash Mapping):
+	// Since Hash is unique, deleting this asset means we definitely delete the file.
 
-	if err := assetService.deleteAssetMetadata(assetID); err != nil {
+	// 1. Delete Metadata
+	if err := s.db.Delete(&Asset{}, "id = ?", assetID).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, ErrorResponse(500, "Failed to delete asset metadata"))
 		return
 	}
 
-	s.mu.Lock()
-	dirPath := asset.StoragePath
-	if actual, ok := assetService.directoryCounter.Load(dirPath); ok {
-		if counter, ok := actual.(*atomic.Int64); ok {
-			if counter.Load() > 0 {
-				counter.Add(-1)
-			}
-		}
+	// 2. Delete Physical File
+	remoteFilePath := s.getStoragePath(asset.Hash)
+	if os.PathSeparator == '\\' {
+		remoteFilePath = strings.ReplaceAll(remoteFilePath, "\\", "/")
 	}
-	s.mu.Unlock()
+
+	obj, err := s.fs.NewObject(c.Request.Context(), remoteFilePath)
+	if err == nil {
+		if err := obj.Remove(c.Request.Context()); err != nil {
+			log.Printf("Warning: Failed to remove physical file %s: %v", remoteFilePath, err)
+		} else {
+			log.Printf("Physical file deleted: %s", remoteFilePath)
+		}
+	} else if err != fs.ErrorObjectNotFound {
+		log.Printf("Warning: Error finding file to delete %s: %v", remoteFilePath, err)
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,

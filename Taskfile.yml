@@ -1,0 +1,24 @@
+version: "3"
+
+dotenv: [".env"]
+
+tasks:
+  default:
+    cmds:
+      - task: build
+
+  build:
+    desc: Build the API server
+    cmds:
+      - go build -o assets-api main.go
+
+  run:
+    desc: Run the API server
+    deps: [build]
+    cmds:
+      - ./assets-api
+
+  clean:
+    desc: Remove artifacts
+    cmds:
+      - rm -f assets-api
